@@ -12,6 +12,7 @@ import (
 	"randomart/nodes"
 	"slices"
 	"sync"
+	"time"
 )
 
 type pool[J any, R any] struct {
@@ -22,8 +23,7 @@ type pool[J any, R any] struct {
 	wg      *sync.WaitGroup
 }
 
-func worker[J any, R any](ctx context.Context, wg *sync.WaitGroup, jobs <-chan J, results chan<- R, process func(job J) R) {
-	defer wg.Done()
+func worker[J any, R any](ctx context.Context, jobs <-chan J, results chan<- R, process func(job J) R) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -50,9 +50,12 @@ func newPool[J any, R any](ctx context.Context, workers int, process func(job J)
 		results         = make(chan R, workers*10)
 		poolCtx, cancel = context.WithCancel(ctx)
 	)
-	for _ := range workers {
+	for _ = range workers {
 		wg.Add(1)
-		go worker(poolCtx, &wg, jobs, results, process)
+		go func() {
+			defer wg.Done()
+			worker(poolCtx, jobs, results, process)
+		}()
 	}
 	return &pool[J, R]{
 		ctx:     poolCtx,
@@ -74,14 +77,11 @@ func (p *pool[J, R]) run(ctx context.Context, job J) error {
 	return nil
 }
 
-func (p *pool[J, R]) stop() {
+func (p *pool[J, R]) stopAndWait() {
 	p.cancel()
 	close(p.jobs)
-	close(p.results)
-}
-
-func (p *pool[J, R]) wait() {
 	p.wg.Wait()
+	close(p.results)
 }
 
 func renderPoint(root nodes.Node, s nodes.State) (color.Color, error) {
@@ -114,14 +114,16 @@ func points(width, height int) iter.Seq2[int, int] {
 }
 
 type frameResult struct {
-	frame int
-	img   image.Image
-	err   error
+	frame     int
+	img       image.Image
+	timeTaken time.Duration
+	err       error
 }
 
 func frames(ctx context.Context, root nodes.Node, options *renderOptions) iter.Seq2[image.Image, error] {
 	return func(yield func(image.Image, error) bool) {
 		framePool := newPool(ctx, max(options.frames, 10), func(frame int) frameResult {
+			start := time.Now()
 			img := image.NewRGBA(image.Rect(0, 0, options.width, options.height))
 			for x, y := range points(options.width, options.height) {
 				src := options.src.At(x, y)
@@ -132,16 +134,13 @@ func frames(ctx context.Context, root nodes.Node, options *renderOptions) iter.S
 					src,
 				))
 				if err != nil {
-					return frameResult{frame: frame, err: err}
+					return frameResult{frame: frame, timeTaken: time.Now().Sub(start), err: err}
 				}
 				img.Set(x, y, c)
 			}
-			return frameResult{frame: frame, img: img}
+			return frameResult{frame: frame, timeTaken: time.Now().Sub(start), img: img}
 		})
-		defer func() {
-			framePool.stop()
-			framePool.wait()
-		}()
+		defer framePool.stopAndWait()
 
 		go func() {
 			for frame := range options.frames {
@@ -152,18 +151,22 @@ func frames(ctx context.Context, root nodes.Node, options *renderOptions) iter.S
 		}()
 
 		var (
-			expectedFrame int
-			buf           []frameResult
+			expectedFrame   int
+			buf             = make([]frameResult, 0, options.frames)
+			timeTakenFrames = make([]time.Duration, 0, options.frames)
 		)
 		sortBuf := func() {
 			slices.SortFunc(buf, func(a, b frameResult) int {
 				return a.frame - b.frame
 			})
 		}
-		for {
+		for expectedFrame < options.frames {
 			select {
 			case <-ctx.Done():
+				yield(nil, ctx.Err())
+				return
 			case result, ok := <-framePool.results:
+				timeTakenFrames = append(timeTakenFrames, result.timeTaken)
 				if !ok {
 					yield(nil, fmt.Errorf("frame result channel closed"))
 					return
@@ -178,10 +181,43 @@ func frames(ctx context.Context, root nodes.Node, options *renderOptions) iter.S
 					buf = append(buf, result)
 					sortBuf()
 				} else {
-					buf = []frameResult{}
+					y := func(img image.Image) bool {
+						ok := yield(img, nil)
+						expectedFrame++
+						return ok
+					}
+
+					if !y(result.img) {
+						return
+					}
+					for len(buf) > 0 {
+						f := buf[0]
+						if f.frame != expectedFrame {
+							break
+						}
+						buf = buf[1:]
+						if !y(f.img) {
+							return
+						}
+					}
 				}
 			}
 		}
+
+		var avg, max, min time.Duration
+		for _, timeTakenFrame := range timeTakenFrames {
+			avg += timeTakenFrame
+			if timeTakenFrame > max {
+				max = timeTakenFrame
+			}
+			if timeTakenFrame < min || min == 0 {
+				min = timeTakenFrame
+			}
+		}
+		avg /= time.Duration(len(timeTakenFrames))
+		options.logf("Average time taken per frame: %s\n", avg)
+		options.logf("Max time taken for a frame: %s\n", max)
+		options.logf("Min time taken for a frame: %s\n", min)
 	}
 }
 
@@ -190,6 +226,7 @@ type renderOptions struct {
 	height int
 	frames int
 	src    image.Image
+	logger func(f string, args ...any)
 }
 
 func (r *renderOptions) apply(opts []RenderOption) (*renderOptions, error) {
@@ -212,6 +249,13 @@ func (r *renderOptions) apply(opts []RenderOption) (*renderOptions, error) {
 		return r, fmt.Errorf("height cannot be negative")
 	}
 	return r, nil
+}
+
+func (r *renderOptions) logf(f string, args ...any) {
+	if r.logger == nil {
+		return
+	}
+	r.logger(f, args...)
 }
 
 func defaultRenderOptions() *renderOptions {
@@ -245,6 +289,13 @@ func WithSourceImage(r io.Reader) RenderOption {
 		var err error
 		options.src, _, err = image.Decode(r)
 		return err
+	}
+}
+
+func WithLogger(f func(f string, args ...any)) RenderOption {
+	return func(options *renderOptions) error {
+		options.logger = f
+		return nil
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"randomart/nodes"
 	"randomart/render"
 	"strings"
+	"syscall"
 )
 
 var (
@@ -23,6 +24,7 @@ var (
 	srcFilename           = flag.String("src", "", "Path to the source image to use as a starting point for the randomart algorithm")
 	optionsOutputFilename = flag.String("ooptions", "", "Path to output generator options to so that the randomart image can be reproduced")
 	optionsInputFilename  = flag.String("ioptions", "", "Path to a JSON file containing options to pass to the generator")
+	verbose               = flag.Bool("verbose", false, "Output more logs")
 )
 
 func main() {
@@ -31,19 +33,20 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sig := make(chan os.Signal)
+	sig := make(chan os.Signal, 1)
 	go func() {
 		defer cancel()
 		select {
 		case <-ctx.Done():
 		case <-sig:
+			fmt.Println("Received interrupt...")
 		}
 	}()
-	signal.Notify(sig, os.Interrupt, os.Kill)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
 	grammarFile, err := os.Open(*grammarFilename)
 	if err != nil {
-		fmt.Printf("could not open grammar file %q: %s\n", grammarFilename, err)
+		fmt.Printf("could not open grammar file %q: %s\n", *grammarFilename, err)
 		return
 	}
 	defer grammarFile.Close()
@@ -59,7 +62,7 @@ func main() {
 	if *optionsInputFilename != "" {
 		optionsInputFile, err := os.Open(*optionsInputFilename)
 		if err != nil {
-			fmt.Printf("could not open input options file %q: %s\n", optionsInputFilename, err)
+			fmt.Printf("could not open input options file %q: %s\n", *optionsInputFilename, err)
 			return
 		}
 		defer optionsInputFile.Close()
@@ -82,22 +85,28 @@ func main() {
 	if *srcFilename != "" {
 		srcFile, err := os.Open(*srcFilename)
 		if err != nil {
-			fmt.Printf("could not open src file %q: %s\n", srcFilename, err)
+			fmt.Printf("could not open src file %q: %s\n", *srcFilename, err)
 			return
 		}
 		defer srcFile.Close()
 		renOpts = append(renOpts, render.WithSourceImage(srcFile))
 	}
+	if *verbose {
+		renOpts = append(renOpts, render.WithLogger(func(f string, args ...any) {
+			fmt.Printf(f, args...)
+		}))
+	}
 
-	err = render.RenderCallback(node, func(no int, img image.Image) error {
-		fmt.Printf("rendering frame %d... ", no)
-		defer fmt.Println("Done!")
-
+	err = render.RenderCallback(ctx, node, func(no int, img image.Image) error {
 		filename := *outputFilename
 		if *frames > 1 {
 			ext := path.Ext(filename)
 			filename = fmt.Sprintf("%s-%03d%s", strings.TrimSuffix(filename, ext), no, ext)
 		}
+
+		fmt.Printf("rendering frame %d to %s... ", no, filename)
+		defer fmt.Println("Done!")
+
 		out, err := os.Create(filename)
 		if err != nil {
 			return fmt.Errorf("could not open output file %q for frame %d: %w", filename, no, err)
@@ -117,7 +126,7 @@ func main() {
 	if *optionsOutputFilename != "" {
 		optionsOutputFile, err := os.Create(*optionsOutputFilename)
 		if err != nil {
-			fmt.Printf("could not open output options file %q: %s\n", optionsOutputFilename, err)
+			fmt.Printf("could not open output options file %q: %s\n", *optionsOutputFilename, err)
 			return
 		}
 		defer optionsOutputFile.Close()
